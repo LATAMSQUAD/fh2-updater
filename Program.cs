@@ -825,10 +825,51 @@ namespace ActualizadorFH2
         }
     }
 
+    // Registro sin barras blancas. La rueda del mouse sigue moviendo el texto.
+    sealed class LogBox : TextBox
+    {
+        const int WM_MOUSEWHEEL = 0x020A;
+        const int EM_LINESCROLL = 0x00B6;
+
+        public LogBox()
+        {
+            Multiline = true;
+            ReadOnly = true;
+            ScrollBars = ScrollBars.None;
+            WordWrap = true;
+            HideSelection = true;
+        }
+
+        public void AgregarLinea(string line)
+        {
+            AppendText(line + Environment.NewLine);
+            SelectionStart = TextLength;
+            ScrollToCaret();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_MOUSEWHEEL)
+            {
+                int delta = (short)((m.WParam.ToInt64() >> 16) & 0xFFFF);
+                int lineas = SystemInformation.MouseWheelScrollLines;
+                if (lineas <= 0)
+                    lineas = 3;
+                int direccion = delta > 0 ? -1 : 1;
+                SendMessage(Handle, EM_LINESCROLL, IntPtr.Zero, (IntPtr)(direccion * lineas));
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        [DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    }
+
     sealed class MainForm : Form
     {
         readonly TextBox txtDest = new TextBox();
-        readonly TextBox txtLog = new TextBox();
+        readonly LogBox txtLog = new LogBox();
         readonly Button btnDest = new Button();
         readonly Button btnUpdate = new Button();
         readonly Button btnCancel = new Button();
@@ -847,8 +888,10 @@ namespace ActualizadorFH2
             Text = "Actualizador Forgotten Hope 2";
             Font = new Font("Segoe UI", 10f);
             StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            SizeGripStyle = SizeGripStyle.Hide;
             ClientSize = new Size(520, 340);
-            MinimumSize = new Size(460, 320);
             BackColor = Color.FromArgb(12, 12, 12);
             ForeColor = Color.White;
             try
@@ -880,6 +923,7 @@ namespace ActualizadorFH2
             txtDest.Text = BuscarCarpetaFh2();
             txtDest.SetBounds(12, 66, 386, 24);
             txtDest.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            txtDest.TextChanged += delegate { ActualizarVersionDetectada(); };
 
             btnDest.Text = "Elegir";
             btnDest.SetBounds(406, 64, 102, 26);
@@ -888,6 +932,7 @@ namespace ActualizadorFH2
             btnDest.Click += delegate { PickFolder(); };
 
             lblInfo.ForeColor = Color.White;
+            lblInfo.AutoEllipsis = true;
             lblInfo.SetBounds(12, 98, 496, 20);
             lblInfo.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
 
@@ -916,8 +961,8 @@ namespace ActualizadorFH2
 
             txtLog.Multiline = true;
             txtLog.ReadOnly = true;
-            txtLog.ScrollBars = ScrollBars.Both;
-            txtLog.WordWrap = false;
+            txtLog.ScrollBars = ScrollBars.None;
+            txtLog.WordWrap = true;
             txtLog.Font = new Font("Consolas", 9f);
             txtLog.BackColor = Color.FromArgb(20, 20, 20);
             txtLog.ForeColor = Color.FromArgb(230, 230, 230);
@@ -1096,6 +1141,67 @@ namespace ActualizadorFH2
             return File.Exists(Path.Combine(dir, "init.con")) && File.Exists(Path.Combine(dir, "mod.desc"));
         }
 
+        // La version del mod esta en mods\fh2\mod.desc, dentro de <version>.
+        static string LeerVersionMod(string dir)
+        {
+            if (string.IsNullOrWhiteSpace(dir))
+                return null;
+            string path = Path.Combine(dir.Trim(), "mod.desc");
+            try
+            {
+                if (!File.Exists(path))
+                    return null;
+                using (var reader = new StreamReader(path, Encoding.UTF8, true))
+                {
+                    char[] buffer = new char[8192];
+                    int read = reader.Read(buffer, 0, buffer.Length);
+                    if (read <= 0)
+                        return null;
+                    return ExtraerVersion(new string(buffer, 0, read));
+                }
+            }
+            catch (IOException)
+            {
+                return null;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return null;
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
+        }
+
+        static string ExtraerVersion(string text)
+        {
+            const string open = "<version>";
+            const string close = "</version>";
+            int start = text.IndexOf(open, StringComparison.OrdinalIgnoreCase);
+            if (start < 0)
+                return null;
+            start += open.Length;
+            int end = text.IndexOf(close, start, StringComparison.OrdinalIgnoreCase);
+            if (end < 0 || end == start)
+                return null;
+            string value = text.Substring(start, end - start).Trim();
+            if (value.Length == 0 || value.Length > 32 || value.IndexOf('<') >= 0)
+                return null;
+            return value;
+        }
+
+        void ActualizarVersionDetectada()
+        {
+            string version = LeerVersionMod(txtDest.Text);
+            string texto = version == null ? "Versión actual: no detectada." : "Versión actual: " + version + ".";
+            if (package != null && version != null && !string.Equals(version, package.FromVersion, StringComparison.OrdinalIgnoreCase))
+                texto += " Se necesita la " + package.FromVersion + ".";
+            if (package != null)
+                texto += " Pesa " + FormatGb(package.CarriedBytes) + ".";
+            lblInfo.Text = texto;
+        }
+
         static string CarpetaMod(string ruta)
         {
             if (string.IsNullOrWhiteSpace(ruta))
@@ -1108,19 +1214,22 @@ namespace ActualizadorFH2
 
         void MainForm_Load(object sender, EventArgs e)
         {
+            MinimumSize = Size;
+            MaximumSize = Size;
             packagePath = Program.PackagePath();
             logPath = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "actualizador-fh2.log");
             string error;
             if (!Package.TryRead(packagePath, out package, out error))
             {
                 btnUpdate.Enabled = false;
-                lblInfo.Text = "No se pudo leer la actualización. " + error;
+                lblStatus.Text = "No se pudo leer la actualización. " + error;
+                ActualizarVersionDetectada();
                 return;
             }
             Text = "Forgotten Hope 2  " + package.ToVersion;
             intro.Text = "De la " + package.FromVersion + " a la " + package.ToVersion
                 + ". Elige mods\\fh2. Tiene que estar en la " + package.FromVersion + ".";
-            lblInfo.Text = "Pesa " + FormatGb(package.CarriedBytes) + ".";
+            ActualizarVersionDetectada();
         }
 
         void PickFolder()
@@ -1145,9 +1254,12 @@ namespace ActualizadorFH2
                 return;
             }
 
+            string versionDetectada = LeerVersionMod(dest);
             string message = "Se aplicará la actualización en:"
                 + Environment.NewLine + Environment.NewLine + dest
                 + Environment.NewLine + Environment.NewLine
+                + "Versión actual: " + (versionDetectada ?? "no detectada") + "."
+                + Environment.NewLine
                 + "Pesa " + FormatGb(package.CarriedBytes) + ".";
             string root = Path.GetPathRoot(dest);
             if (!string.IsNullOrEmpty(root))
@@ -1214,7 +1326,7 @@ namespace ActualizadorFH2
                 return;
             BeginInvoke((Action)delegate
             {
-                txtLog.AppendText(line + Environment.NewLine);
+                txtLog.AgregarLinea(line);
                 try
                 {
                     File.AppendAllText(logPath, line + Environment.NewLine, Encoding.UTF8);
