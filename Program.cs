@@ -11,7 +11,7 @@ using Microsoft.Win32;
 
 namespace ActualizadorFH2
 {
-    // Actualizacion portable de FH2 5.5.512 a 5.6.507.
+    // Actualizacion portable de FH2 5.6.507 a 5.6.586.
     // Los zip no se copian enteros: se guardan solo los trozos que cambiaron
     // y, al aplicar, se rearma el zip identico al oficial usando el zip viejo.
     // Formato al final del exe (o de un .dat si no cupiera):
@@ -680,7 +680,7 @@ namespace ActualizadorFH2
                     else if (kind == 2)
                     {
                         if (a < 0 || b < 0 || a + b > oldFile.Length)
-                            throw new InvalidDataException("El zip anterior no es el de la versión 5.5.512.");
+                            throw new InvalidDataException("El archivo anterior no es el de la versión 5.6.507.");
                         oldFile.Seek(a, SeekOrigin.Begin);
                         long left = b;
                         while (left > 0)

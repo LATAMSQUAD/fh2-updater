@@ -2,13 +2,14 @@
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STUB = os.path.join(ROOT, "fh2_stub.exe")
-SRC = r"C:\Program Files (x86)\Forgotten Hope 2\mods\fh2"
-OLD = SRC + " - copia"
+# Archivos nuevos que el usuario dejo en update\. La version anterior queda aparte.
+SRC = os.path.join(ROOT, "update")
+OLD = r"C:\Program Files (x86)\Forgotten Hope 2\mods\fh2 5.6.507"
 LIST = os.path.join(ROOT, "copy-list.txt")
 DEL = os.path.join(ROOT, "delete-list.txt")
-OUT = os.path.join(ROOT, "fh2_update_5.5.512_to_5.6.507.new.exe")
-TO = "5.6.507"
-FROM = "5.5.512"
+OUT = os.path.join(ROOT, "fh2_update_5.6.507_to_5.6.586.exe")
+TO = "5.6.586"
+FROM = "5.6.507"
 MODE_FULL = 1
 MODE_REBUILD = 2
 
@@ -299,6 +300,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "full":
         build_all()
     else:
-        rel = r"levels\alam_halfa\client.zip"
+        rel = r"levels\bure\server.zip"
         ok = build_one_for_test(rel)
         sys.exit(0 if ok else 1)
