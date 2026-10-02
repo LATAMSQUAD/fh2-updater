@@ -11,9 +11,9 @@ using Microsoft.Win32;
 
 namespace ActualizadorFH2
 {
-    // Actualizacion portable de FH2 5.6.507 a 5.6.586.
-    // Los zip no se copian enteros: se guardan solo los trozos que cambiaron
-    // y, al aplicar, se rearma el zip identico al oficial usando el zip viejo.
+    // Aplica el paquete que viaja al final de este exe.
+    // Servidor: reemplaza archivos enteros. Cliente: cambia archivos dentro de los zip.
+    // Las versiones salen del indice del paquete.
     // Formato al final del exe (o de un .dat si no cupiera):
     //   datos de cada archivo
     //   indice
@@ -23,6 +23,7 @@ namespace ActualizadorFH2
         const string Magic = "FH2UPD02";
         public const int ModeFull = 1;
         public const int ModeRebuild = 2;
+        public const int ModeZipPatch = 3;
 
         [STAThread]
         static int Main(string[] args)
@@ -31,6 +32,8 @@ namespace ActualizadorFH2
                 return SelfTest();
             if (args.Length > 0 && args[0] == "--verificar")
                 return Verify(PackagePath());
+            if (args.Length > 1 && args[0] == "--aplicar")
+                return ApplyCli(args[1]);
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -106,6 +109,20 @@ namespace ActualizadorFH2
             return code;
         }
 
+        static int ApplyCli(string destination)
+        {
+            string packagePath = PackagePath();
+            Package package;
+            string error;
+            if (!Package.TryRead(packagePath, out package, out error))
+                return Fail(error);
+            var patcher = new Patcher();
+            PatchResult result = patcher.Apply(packagePath, package, destination);
+            if (result.Cancelled || result.Errors != 0)
+                return Fail("errors=" + result.Errors);
+            return 0;
+        }
+
         // Reconstruye un archivo de prueba a partir del viejo y comprueba que queda igual al nuevo.
         static int SelfTest()
         {
@@ -153,7 +170,8 @@ namespace ActualizadorFH2
                 bool copied = result.Copied == 2 && result.Deleted == 1 && result.Errors == 0 && content;
                 string outside;
                 bool blocked = !Patcher.TryMap(dest, "..\\afuera.txt", out outside);
-                string status = copied && blocked ? "OK" : "FAIL";
+                bool zipOk = RunZipPatchTest(baseDir);
+                string status = copied && blocked && zipOk ? "OK" : "FAIL";
                 File.WriteAllText(Path.Combine(AppDir(), "probar-resultado.txt"),
                     status + " copied=" + copied + " blocked=" + blocked + " errors=" + result.Errors, Encoding.UTF8);
                 return status == "OK" ? 0 : 1;
@@ -169,6 +187,166 @@ namespace ActualizadorFH2
                 {
                 }
             }
+        }
+
+        static bool RunZipPatchTest(string baseDir)
+        {
+            string packed = Path.Combine(baseDir, "zip.exe");
+            string dest = Path.Combine(baseDir, "zipdest");
+            Directory.CreateDirectory(dest);
+            File.WriteAllBytes(Path.Combine(dest, "piezas.zip"), MakeStoredZip(
+                new[] { "keep.txt", "old.txt", "gone.txt" },
+                new[] { Encoding.ASCII.GetBytes("KEEP"), Encoding.ASCII.GetBytes("OLD!"), Encoding.ASCII.GetBytes("GONE") }));
+            File.WriteAllBytes(packed, new byte[] { 0x4D, 0x5A });
+            byte[] blob = BuildZipPatchBlob(
+                "old.txt", Encoding.ASCII.GetBytes("NEW!"),
+                "add.txt", Encoding.ASCII.GetBytes("ADD!"),
+                "gone.txt");
+            var file = new PackageFile();
+            file.RelativePath = "piezas.zip";
+            file.Mode = ModeZipPatch;
+            file.OutputSize = 0;
+            file.Crc = Crc32.Compute(blob);
+            using (var stream = new FileStream(packed, FileMode.Append, FileAccess.Write, FileShare.Read))
+            {
+                file.Offset = stream.Length;
+                stream.Write(blob, 0, blob.Length);
+                file.BlobLength = blob.Length;
+            }
+            PackageWriter.Finish(packed, "5.6.586", "5.5.512", new[] { file }, new string[0]);
+            Package package;
+            string error;
+            if (!Package.TryRead(packed, out package, out error))
+                return false;
+            var patcher = new Patcher();
+            PatchResult result = patcher.Apply(packed, package, dest);
+            if (result.Errors != 0 || result.Copied != 1)
+                return false;
+            string keep, replaced, added;
+            if (!ReadStoredZipText(Path.Combine(dest, "piezas.zip"), "keep.txt", out keep))
+                return false;
+            if (!ReadStoredZipText(Path.Combine(dest, "piezas.zip"), "old.txt", out replaced))
+                return false;
+            if (!ReadStoredZipText(Path.Combine(dest, "piezas.zip"), "add.txt", out added))
+                return false;
+            byte[] gone;
+            bool removed = !Patcher.TryReadZipEntry(Path.Combine(dest, "piezas.zip"), "gone.txt", out gone);
+            return keep == "KEEP" && replaced == "NEW!" && added == "ADD!" && removed;
+        }
+
+        static byte[] BuildZipPatchBlob(string replaceName, byte[] replaceData, string addName, byte[] addData, string deleteName)
+        {
+            var blob = new MemoryStream();
+            WriteU32(blob, 3);
+            WriteZipPut(blob, replaceName, replaceData);
+            WriteZipPut(blob, addName, addData);
+            WriteZipDelete(blob, deleteName);
+            return blob.ToArray();
+        }
+
+        static void WriteZipPut(Stream blob, string name, byte[] data)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            blob.WriteByte(1);
+            WriteU16(blob, (ushort)nameBytes.Length);
+            blob.Write(nameBytes, 0, nameBytes.Length);
+            WriteU16(blob, 0);
+            WriteU16(blob, 0);
+            WriteU16(blob, 0);
+            WriteU16(blob, 0);
+            WriteU32(blob, Crc32.Compute(data));
+            WriteU32(blob, (uint)data.Length);
+            WriteU32(blob, (uint)data.Length);
+            blob.Write(data, 0, data.Length);
+        }
+
+        static void WriteZipDelete(Stream blob, string name)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            blob.WriteByte(2);
+            WriteU16(blob, (ushort)nameBytes.Length);
+            blob.Write(nameBytes, 0, nameBytes.Length);
+        }
+
+        internal static void WriteU16(Stream stream, ushort value)
+        {
+            stream.WriteByte((byte)(value & 0xFF));
+            stream.WriteByte((byte)((value >> 8) & 0xFF));
+        }
+
+        internal static void WriteU32(Stream stream, uint value)
+        {
+            stream.WriteByte((byte)(value & 0xFF));
+            stream.WriteByte((byte)((value >> 8) & 0xFF));
+            stream.WriteByte((byte)((value >> 16) & 0xFF));
+            stream.WriteByte((byte)((value >> 24) & 0xFF));
+        }
+
+        static byte[] MakeStoredZip(string[] names, byte[][] datas)
+        {
+            var locals = new MemoryStream();
+            var central = new MemoryStream();
+            for (int i = 0; i < names.Length; i++)
+            {
+                byte[] name = Encoding.UTF8.GetBytes(names[i]);
+                uint crc = Crc32.Compute(datas[i]);
+                long localOffset = locals.Length;
+                WriteU32(locals, 0x04034b50);
+                WriteU16(locals, 20);
+                WriteU16(locals, 0);
+                WriteU16(locals, 0);
+                WriteU16(locals, 0);
+                WriteU16(locals, 0);
+                WriteU32(locals, crc);
+                WriteU32(locals, (uint)datas[i].Length);
+                WriteU32(locals, (uint)datas[i].Length);
+                WriteU16(locals, (ushort)name.Length);
+                WriteU16(locals, 0);
+                locals.Write(name, 0, name.Length);
+                locals.Write(datas[i], 0, datas[i].Length);
+                WriteU32(central, 0x02014b50);
+                WriteU16(central, 20);
+                WriteU16(central, 20);
+                WriteU16(central, 0);
+                WriteU16(central, 0);
+                WriteU16(central, 0);
+                WriteU16(central, 0);
+                WriteU32(central, crc);
+                WriteU32(central, (uint)datas[i].Length);
+                WriteU32(central, (uint)datas[i].Length);
+                WriteU16(central, (ushort)name.Length);
+                WriteU16(central, 0);
+                WriteU16(central, 0);
+                WriteU16(central, 0);
+                WriteU16(central, 0);
+                WriteU32(central, 0);
+                WriteU32(central, (uint)localOffset);
+                central.Write(name, 0, name.Length);
+            }
+            var zip = new MemoryStream();
+            byte[] localBytes = locals.ToArray();
+            byte[] centralBytes = central.ToArray();
+            zip.Write(localBytes, 0, localBytes.Length);
+            zip.Write(centralBytes, 0, centralBytes.Length);
+            WriteU32(zip, 0x06054b50);
+            WriteU16(zip, 0);
+            WriteU16(zip, 0);
+            WriteU16(zip, (ushort)names.Length);
+            WriteU16(zip, (ushort)names.Length);
+            WriteU32(zip, (uint)centralBytes.Length);
+            WriteU32(zip, (uint)localBytes.Length);
+            WriteU16(zip, 0);
+            return zip.ToArray();
+        }
+
+        static bool ReadStoredZipText(string path, string name, out string text)
+        {
+            text = null;
+            byte[] data;
+            if (!Patcher.TryReadZipEntry(path, name, out data))
+                return false;
+            text = Encoding.ASCII.GetString(data);
+            return true;
         }
 
         static int Fail(string message)
@@ -267,7 +445,7 @@ namespace ActualizadorFH2
                         file.Offset = ReadInt64(reader);
                         file.BlobLength = ReadInt64(reader);
                         file.Crc = ReadUInt32(reader);
-                        if (file.Mode != Program.ModeFull && file.Mode != Program.ModeRebuild)
+                        if (file.Mode != Program.ModeFull && file.Mode != Program.ModeRebuild && file.Mode != Program.ModeZipPatch)
                         {
                             error = "Tipo de archivo desconocido: " + file.RelativePath;
                             return false;
@@ -555,8 +733,12 @@ namespace ActualizadorFH2
                         uint crc = Crc32.Start();
                         if (file.Mode == Program.ModeFull)
                             crc = WriteFull(pack, file, tempFile, buffer, crc);
-                        else
+                        else if (file.Mode == Program.ModeRebuild)
                             crc = WriteRebuild(pack, file, destFile, tempFile, buffer, crc);
+                        else if (file.Mode == Program.ModeZipPatch)
+                            crc = WriteZipPatch(pack, file, destFile, tempFile, buffer, crc);
+                        else
+                            throw new InvalidDataException("Tipo de archivo desconocido.");
                         if (Crc32.Finish(crc) != file.Crc)
                         {
                             result.Errors++;
@@ -680,7 +862,7 @@ namespace ActualizadorFH2
                     else if (kind == 2)
                     {
                         if (a < 0 || b < 0 || a + b > oldFile.Length)
-                            throw new InvalidDataException("El archivo anterior no es el de la versión 5.6.507.");
+                            throw new InvalidDataException("El archivo anterior no coincide con la versión de origen.");
                         oldFile.Seek(a, SeekOrigin.Begin);
                         long left = b;
                         while (left > 0)
@@ -746,6 +928,431 @@ namespace ActualizadorFH2
             }
             blobLeft -= count;
             return data;
+        }
+
+        // Cambia archivos dentro de un zip que el cliente ya tiene.
+        // El blob trae altas, reemplazos y bajas. Lo demas se copia tal cual.
+        static uint WriteZipPatch(FileStream pack, PackageFile file, string destFile, string tempFile, byte[] buffer, uint crc)
+        {
+            if (!File.Exists(destFile))
+                throw new FileNotFoundException("Falta el zip de la versión anterior.", destFile);
+            pack.Seek(file.Offset, SeekOrigin.Begin);
+            long left = file.BlobLength;
+            List<ZipOp> ops = ReadZipOps(pack, ref left, ref crc, buffer);
+            if (left != 0)
+                throw new InvalidDataException("El paquete de " + file.RelativePath + " no cierra.");
+            RewriteZip(destFile, tempFile, ops, pack, buffer);
+            return crc;
+        }
+
+        sealed class ZipOp
+        {
+            public int Kind;
+            public string Name;
+            public ushort Method;
+            public ushort Flags;
+            public ushort Time;
+            public ushort Date;
+            public uint Crc;
+            public uint CompSize;
+            public uint UncompSize;
+            public long DataPos;
+        }
+
+        sealed class ZipEntry
+        {
+            public string Name;
+            public byte[] NameBytes;
+            public ushort Method;
+            public ushort Flags;
+            public ushort Time;
+            public ushort Date;
+            public uint Crc;
+            public uint CompSize;
+            public uint UncompSize;
+            public long DataOffset;
+            public bool Delete;
+            public ZipOp Replacement;
+        }
+
+        static List<ZipOp> ReadZipOps(FileStream pack, ref long left, ref uint crc, byte[] buffer)
+        {
+            int count = ReadCrcInt(pack, ref left, ref crc);
+            if (count < 0 || count > 200000)
+                throw new InvalidDataException("Demasiados cambios dentro del zip.");
+            var ops = new List<ZipOp>();
+            for (int i = 0; i < count; i++)
+            {
+                int kind = ReadCrcByte(pack, ref left, ref crc);
+                int nameLen = ReadCrcU16(pack, ref left, ref crc);
+                if (nameLen <= 0 || nameLen > 1024)
+                    throw new InvalidDataException("Nombre interno invalido.");
+                byte[] nameBytes = ReadCrcBytes(pack, nameLen, ref left, ref crc, buffer);
+                var op = new ZipOp();
+                op.Kind = kind;
+                op.Name = Encoding.UTF8.GetString(nameBytes).Replace('\\', '/');
+                if (kind == 2)
+                {
+                    ops.Add(op);
+                    continue;
+                }
+                if (kind != 1)
+                    throw new InvalidDataException("Cambio de zip desconocido.");
+                op.Method = (ushort)ReadCrcU16(pack, ref left, ref crc);
+                op.Flags = (ushort)ReadCrcU16(pack, ref left, ref crc);
+                op.Time = (ushort)ReadCrcU16(pack, ref left, ref crc);
+                op.Date = (ushort)ReadCrcU16(pack, ref left, ref crc);
+                op.Crc = (uint)ReadCrcInt(pack, ref left, ref crc);
+                op.CompSize = (uint)ReadCrcInt(pack, ref left, ref crc);
+                op.UncompSize = (uint)ReadCrcInt(pack, ref left, ref crc);
+                if (op.CompSize > int.MaxValue)
+                    throw new InvalidDataException("Archivo interno demasiado grande.");
+                op.DataPos = pack.Position;
+                SkipCrc(pack, op.CompSize, ref left, ref crc, buffer);
+                ops.Add(op);
+            }
+            return ops;
+        }
+
+        static void RewriteZip(string destFile, string tempFile, List<ZipOp> ops, FileStream pack, byte[] buffer)
+        {
+            var entries = new List<ZipEntry>();
+            var byName = new Dictionary<string, ZipEntry>(StringComparer.OrdinalIgnoreCase);
+            using (var oldZip = new FileStream(destFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                ReadCentralDirectory(oldZip, entries, buffer);
+                foreach (ZipEntry entry in entries)
+                    byName[entry.Name] = entry;
+                var added = new List<ZipOp>();
+                foreach (ZipOp op in ops)
+                {
+                    ZipEntry entry;
+                    if (!byName.TryGetValue(op.Name, out entry))
+                    {
+                        if (op.Kind == 1)
+                            added.Add(op);
+                        continue;
+                    }
+                    if (op.Kind == 2)
+                        entry.Delete = true;
+                    else
+                        entry.Replacement = op;
+                }
+                using (var output = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    var written = new List<ZipEntry>();
+                    foreach (ZipEntry entry in entries)
+                    {
+                        if (entry.Delete)
+                            continue;
+                        entry.DataOffset = output.Position;
+                        if (entry.Replacement != null)
+                            WriteReplaced(output, entry, pack, buffer);
+                        else
+                            WriteCopied(output, entry, oldZip, buffer);
+                        written.Add(entry);
+                    }
+                    foreach (ZipOp op in added)
+                    {
+                        var entry = new ZipEntry();
+                        entry.Name = op.Name;
+                        entry.NameBytes = Encoding.UTF8.GetBytes(op.Name);
+                        entry.Replacement = op;
+                        entry.DataOffset = output.Position;
+                        WriteReplaced(output, entry, pack, buffer);
+                        written.Add(entry);
+                    }
+                    if (written.Count > 65535)
+                        throw new InvalidDataException("El zip tiene demasiados archivos internos.");
+                    long centralOffset = output.Position;
+                    foreach (ZipEntry entry in written)
+                        WriteCentral(output, entry);
+                    long centralSize = output.Position - centralOffset;
+                    if (centralOffset > uint.MaxValue || centralSize > uint.MaxValue)
+                        throw new InvalidDataException("El zip quedó demasiado grande.");
+                    WriteU32(output, 0x06054b50);
+                    WriteU16(output, 0);
+                    WriteU16(output, 0);
+                    WriteU16(output, (ushort)written.Count);
+                    WriteU16(output, (ushort)written.Count);
+                    WriteU32(output, (uint)centralSize);
+                    WriteU32(output, (uint)centralOffset);
+                    WriteU16(output, 0);
+                }
+            }
+        }
+
+        static void ReadCentralDirectory(FileStream zip, List<ZipEntry> entries, byte[] buffer)
+        {
+            long eocd = FindEocd(zip, buffer);
+            zip.Seek(eocd + 10, SeekOrigin.Begin);
+            int count = ReadU16(zip);
+            uint centralSize = ReadU32(zip);
+            uint centralOffset = ReadU32(zip);
+            if (centralOffset == 0xFFFFFFFF || centralSize == 0xFFFFFFFF)
+                throw new InvalidDataException("Ese zip usa un formato que este actualizador no puede rearmar.");
+            zip.Seek(centralOffset, SeekOrigin.Begin);
+            long end = centralOffset + centralSize;
+            for (int i = 0; i < count; i++)
+            {
+                if (zip.Position + 46 > end)
+                    throw new InvalidDataException("El indice del zip está dañado.");
+                uint sig = ReadU32(zip);
+                if (sig != 0x02014b50)
+                    throw new InvalidDataException("El indice del zip está dañado.");
+                zip.Seek(4, SeekOrigin.Current);
+                var entry = new ZipEntry();
+                entry.Flags = ReadU16(zip);
+                entry.Method = ReadU16(zip);
+                entry.Time = ReadU16(zip);
+                entry.Date = ReadU16(zip);
+                entry.Crc = ReadU32(zip);
+                entry.CompSize = ReadU32(zip);
+                entry.UncompSize = ReadU32(zip);
+                int nameLen = ReadU16(zip);
+                int extraLen = ReadU16(zip);
+                int commentLen = ReadU16(zip);
+                zip.Seek(8, SeekOrigin.Current);
+                uint localOffset = ReadU32(zip);
+                byte[] nameBytes = ReadExactSmall(zip, nameLen);
+                if (extraLen > 0)
+                    zip.Seek(extraLen, SeekOrigin.Current);
+                if (commentLen > 0)
+                    zip.Seek(commentLen, SeekOrigin.Current);
+                entry.NameBytes = nameBytes;
+                entry.Name = Encoding.UTF8.GetString(nameBytes).Replace('\\', '/');
+                entry.DataOffset = LocalDataOffset(zip, localOffset);
+                entries.Add(entry);
+            }
+        }
+
+        static long LocalDataOffset(FileStream zip, uint localOffset)
+        {
+            long back = zip.Position;
+            zip.Seek(localOffset, SeekOrigin.Begin);
+            uint sig = ReadU32(zip);
+            if (sig != 0x04034b50)
+                throw new InvalidDataException("Cabecera de zip invalida.");
+            zip.Seek(22, SeekOrigin.Current);
+            int nameLen = ReadU16(zip);
+            int extraLen = ReadU16(zip);
+            long data = localOffset + 30 + nameLen + extraLen;
+            zip.Seek(back, SeekOrigin.Begin);
+            return data;
+        }
+
+        static long FindEocd(FileStream zip, byte[] buffer)
+        {
+            int scan = (int)Math.Min(zip.Length, 65557);
+            if (scan < 22)
+                throw new InvalidDataException("El archivo no es un zip.");
+            zip.Seek(zip.Length - scan, SeekOrigin.Begin);
+            byte[] tail = ReadExactSmall(zip, scan);
+            for (int i = tail.Length - 22; i >= 0; i--)
+            {
+                if (tail[i] == 0x50 && tail[i + 1] == 0x4B && tail[i + 2] == 0x05 && tail[i + 3] == 0x06)
+                    return zip.Length - scan + i;
+            }
+            throw new InvalidDataException("El archivo no es un zip.");
+        }
+
+        static void WriteCopied(Stream output, ZipEntry entry, FileStream oldZip, byte[] buffer)
+        {
+            WriteLocalHeader(output, entry.NameBytes, entry.Method, entry.Flags, entry.Time, entry.Date, entry.Crc, entry.CompSize, entry.UncompSize);
+            oldZip.Seek(entry.DataOffset, SeekOrigin.Begin);
+            CopyExact(oldZip, output, entry.CompSize, buffer);
+        }
+
+        static void WriteReplaced(Stream output, ZipEntry entry, FileStream pack, byte[] buffer)
+        {
+            ZipOp op = entry.Replacement;
+            byte[] nameBytes = entry.NameBytes != null ? entry.NameBytes : Encoding.UTF8.GetBytes(op.Name);
+            WriteLocalHeader(output, nameBytes, op.Method, op.Flags, op.Time, op.Date, op.Crc, op.CompSize, op.UncompSize);
+            pack.Seek(op.DataPos, SeekOrigin.Begin);
+            CopyExact(pack, output, op.CompSize, buffer);
+            entry.Method = op.Method;
+            entry.Flags = op.Flags;
+            entry.Time = op.Time;
+            entry.Date = op.Date;
+            entry.Crc = op.Crc;
+            entry.CompSize = op.CompSize;
+            entry.UncompSize = op.UncompSize;
+            entry.NameBytes = nameBytes;
+        }
+
+        static void WriteU16(Stream stream, ushort value)
+        {
+            Program.WriteU16(stream, value);
+        }
+
+        static void WriteU32(Stream stream, uint value)
+        {
+            Program.WriteU32(stream, value);
+        }
+
+        static void WriteLocalHeader(Stream output, byte[] name, ushort method, ushort flags, ushort time, ushort date, uint crc, uint comp, uint uncomp)
+        {
+            flags = (ushort)(flags & ~8);
+            WriteU32(output, 0x04034b50);
+            WriteU16(output, 20);
+            WriteU16(output, flags);
+            WriteU16(output, method);
+            WriteU16(output, time);
+            WriteU16(output, date);
+            WriteU32(output, crc);
+            WriteU32(output, comp);
+            WriteU32(output, uncomp);
+            WriteU16(output, (ushort)name.Length);
+            WriteU16(output, 0);
+            output.Write(name, 0, name.Length);
+        }
+
+        static void WriteCentral(Stream output, ZipEntry entry)
+        {
+            byte[] name = entry.NameBytes;
+            WriteU32(output, 0x02014b50);
+            WriteU16(output, 20);
+            WriteU16(output, 20);
+            WriteU16(output, (ushort)(entry.Flags & ~8));
+            WriteU16(output, entry.Method);
+            WriteU16(output, entry.Time);
+            WriteU16(output, entry.Date);
+            WriteU32(output, entry.Crc);
+            WriteU32(output, entry.CompSize);
+            WriteU32(output, entry.UncompSize);
+            WriteU16(output, (ushort)name.Length);
+            WriteU16(output, 0);
+            WriteU16(output, 0);
+            WriteU16(output, 0);
+            WriteU16(output, 0);
+            WriteU32(output, 0);
+            WriteU32(output, (uint)entry.DataOffset);
+            output.Write(name, 0, name.Length);
+        }
+
+        public static bool TryReadZipEntry(string path, string name, out byte[] data)
+        {
+            data = null;
+            try
+            {
+                using (var zip = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    var entries = new List<ZipEntry>();
+                    ReadCentralDirectory(zip, entries, new byte[4096]);
+                    foreach (ZipEntry entry in entries)
+                    {
+                        if (!string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (entry.Method != 0 || entry.UncompSize > int.MaxValue)
+                            return false;
+                        zip.Seek(entry.DataOffset, SeekOrigin.Begin);
+                        data = ReadExactSmall(zip, (int)entry.UncompSize);
+                        return true;
+                    }
+                }
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (InvalidDataException)
+            {
+                return false;
+            }
+            return false;
+        }
+
+        static void CopyExact(Stream source, Stream dest, uint count, byte[] buffer)
+        {
+            long left = count;
+            while (left > 0)
+            {
+                int want = (int)Math.Min(buffer.Length, left);
+                int read = source.Read(buffer, 0, want);
+                if (read <= 0)
+                    throw new EndOfStreamException("Zip incompleto.");
+                dest.Write(buffer, 0, read);
+                left -= read;
+            }
+        }
+
+        static int ReadCrcByte(FileStream pack, ref long left, ref uint crc)
+        {
+            byte[] data = ReadCrcBytes(pack, 1, ref left, ref crc, null);
+            return data[0];
+        }
+
+        static int ReadCrcU16(FileStream pack, ref long left, ref uint crc)
+        {
+            byte[] data = ReadCrcBytes(pack, 2, ref left, ref crc, null);
+            return data[0] | (data[1] << 8);
+        }
+
+        static int ReadCrcInt(FileStream pack, ref long left, ref uint crc)
+        {
+            byte[] data = ReadCrcBytes(pack, 4, ref left, ref crc, null);
+            return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+        }
+
+        static byte[] ReadCrcBytes(FileStream pack, int count, ref long left, ref uint crc, byte[] buffer)
+        {
+            if (count < 0 || left < count)
+                throw new EndOfStreamException("Paquete truncado.");
+            byte[] data = new byte[count];
+            int offset = 0;
+            while (offset < count)
+            {
+                int read = pack.Read(data, offset, count - offset);
+                if (read <= 0)
+                    throw new EndOfStreamException("Paquete truncado.");
+                offset += read;
+            }
+            left -= count;
+            crc = Crc32.Update(crc, data, count);
+            return data;
+        }
+
+        static void SkipCrc(FileStream pack, uint count, ref long left, ref uint crc, byte[] buffer)
+        {
+            long remaining = count;
+            if (left < remaining)
+                throw new EndOfStreamException("Paquete truncado.");
+            while (remaining > 0)
+            {
+                int want = (int)Math.Min(buffer.Length, remaining);
+                int read = pack.Read(buffer, 0, want);
+                if (read <= 0)
+                    throw new EndOfStreamException("Paquete truncado.");
+                crc = Crc32.Update(crc, buffer, read);
+                remaining -= read;
+                left -= read;
+            }
+        }
+
+        static byte[] ReadExactSmall(Stream stream, int count)
+        {
+            byte[] data = new byte[count];
+            int offset = 0;
+            while (offset < count)
+            {
+                int read = stream.Read(data, offset, count - offset);
+                if (read <= 0)
+                    throw new EndOfStreamException("Zip incompleto.");
+                offset += read;
+            }
+            return data;
+        }
+
+        static ushort ReadU16(Stream stream)
+        {
+            byte[] data = ReadExactSmall(stream, 2);
+            return (ushort)(data[0] | (data[1] << 8));
+        }
+
+        static uint ReadU32(Stream stream)
+        {
+            byte[] data = ReadExactSmall(stream, 4);
+            return (uint)(data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24));
         }
 
         static void ReplaceFile(string tempFile, string destFile)
